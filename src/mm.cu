@@ -1,228 +1,167 @@
-// Matrix multiply C = A * B for the GPU memory tutorial.
+// Matrix multiply C = A * B, FP32, N x N, row-major.
 //
-// All matrices are N x N, float, stored row-major:
-//     element (row, col) is at index [row * N + col]
+// Stages (the numbers match the earlier, larger version of this file, so old results line up):
 //
-// Every kernel uses 32 x 32 thread blocks and computes ONE element of C per thread.
-// The kernels differ only in how threads read A and B from memory:
+//     0     naive, uncoalesced global loads
+//     1     naive, coalesced global loads
+//     2     shared-memory tile (Lecture 3), no bank conflicts
+//     17    shared tile with B stored transposed, pitch 32   ->  32-way bank conflicts
+//     18    same kernel, pitch 33 (one padding column)      ->  no bank conflicts
 //
-//     naive_uncoalesced       global memory, neighbouring threads read far-apart addresses
-//     coalesced               global memory, neighbouring threads read neighbouring addresses
-//     shared                  32 x 32 tiles copied into shared memory and reused
-//     shared_bank_conflict    shared tile of B stored transposed  ->  32-way bank conflicts
-//     shared_padded           same, with one padding column       ->  no bank conflicts
-//
-// Usage:   ./build/mm KERNEL [N=4096] [REPS=20]
-// Output:  kernel,n,reps,median_ms,gflops,checked_elements,max_abs_error
+// Usage:   ./build/mm STAGE [N=1024] [REPS=20]
+// Output:  stage,n,precision,reps,median_ms,tflops,checked_elements,max_abs_error
 
 #include <cuda_runtime.h>
-#include <nvtx3/nvToolsExt.h>		// NVTX: labels a code range so profilers can find it
+#include <nvtx3/nvToolsExt.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 
-#define TILE 32		// block is TILE x TILE threads, and the shared-memory tile is TILE x TILE
+#define TILE 32
 
 
-// Stop with a message if a CUDA call fails.
-#define CHECK(call) {								\
-	cudaError_t err = (call);						\
-	if (err != cudaSuccess) {						\
-		printf("CUDA error: %s (line %d)\n", cudaGetErrorString(err), __LINE__);	\
-		exit(1);							\
-	}									\
+#define CUDA(call) {										\
+	cudaError_t err = (call);								\
+	if (err != cudaSuccess) {								\
+		fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err));	\
+		exit(1);									\
+	}											\
 }
 
 
 
-// =====================================================================================
-// Kernel 1: naive, UNCOALESCED
-//
-// threadIdx.x picks the ROW.
-// The 32 threads of a warp (consecutive threadIdx.x) work on 32 different rows,
-// so their reads of A[row][k] are N floats apart: 32 separate memory transactions.
-// =====================================================================================
-__global__ void matmul_uncoalesced(float *A, float *B, float *C, int N) {
-	int row = blockIdx.y * TILE + threadIdx.x;		// x -> row     (the mistake)
+// Stage 0: threadIdx.x picks the ROW, so neighbouring threads read addresses N floats apart.
+__global__ void naive_uncoalesced(const float* a, const float* b, float* c, int n) {
+	int row = blockIdx.y * TILE + threadIdx.x; // OBSERVE: threadIdx.x picks the ROW, not the COLUMN
 	int col = blockIdx.x * TILE + threadIdx.y;
 
-	float sum = 0.0f;
+	float v = 0;
 
-	for (int k = 0; k < N; k++) {
-		sum += A[row * N + k] * B[k * N + col];
+	for (int k = 0; k < n; k++) {
+		v += a[row * n + k] * b[k * n + col];
 	}
 
-	C[row * N + col] = sum;
+	c[row * n + col] = v;
 }
 
 
 
-// =====================================================================================
-// Kernel 2: naive, COALESCED
-//
-// Only change: threadIdx.x picks the COLUMN.
-// A warp now reads 32 consecutive floats of B (one 128-byte transaction)
-// and a single value of A that all 32 threads share.
-// =====================================================================================
-__global__ void matmul_coalesced(float *A, float *B, float *C, int N) {
-	int row = blockIdx.y * TILE + threadIdx.y;
-	int col = blockIdx.x * TILE + threadIdx.x;		// x -> column  (the fix)
+// Stage 1: threadIdx.x picks the COLUMN, so a warp reads 32 consecutive floats of B.
+__global__ void naive_coalesced(const float* a, const float* b, float* c, int n) {
+	int row = blockIdx.y * TILE + threadIdx.y; // OBSERVE: threadIdx.y picks the ROW, not the COLUMN
+	int col = blockIdx.x * TILE + threadIdx.x;
 
-	float sum = 0.0f;
+	float v = 0;
 
-	for (int k = 0; k < N; k++) {
-		sum += A[row * N + k] * B[k * N + col];
+	for (int k = 0; k < n; k++) {
+		v += a[row * n + k] * b[k * n + col];
 	}
 
-	C[row * N + col] = sum;
+	c[row * n + col] = v;
 }
 
 
 
-// =====================================================================================
-// Kernel 3: SHARED-MEMORY TILING
-//
-// The block walks along K one 32-wide tile at a time:
-//     1. each thread copies one element of A and one element of B into shared memory
-//     2. wait until the whole tile is loaded
-//     3. each thread does 32 multiply-adds, reading only shared memory
-//     4. wait until everyone is done before the tile is overwritten
-// Each value loaded from global memory is now reused by 32 threads.
-//
-// Bank conflicts? Inside a warp only tx changes:
-//     As[ty][k]    same address for all 32 threads     ->  broadcast, no conflict
-//     Bs[k][tx]    32 consecutive floats = 32 banks    ->  no conflict
-// =====================================================================================
-__global__ void matmul_shared(float *A, float *B, float *C, int N) {
-	__shared__ float As[TILE][TILE];
-	__shared__ float Bs[TILE][TILE];
+// Stage 2: one result per thread, 32 x 32 tiles of A and B in shared memory.
+// Within a warp only x changes: as[y][k] is a broadcast and bs[k][x] hits 32 different banks.
+__global__ void shared_tile(const float* a, const float* b, float* c, int n) {
+	__shared__ float as[TILE][TILE];
+	__shared__ float bs[TILE][TILE];
 
-	int tx = threadIdx.x;
-	int ty = threadIdx.y;
+	int x = threadIdx.x;
+	int y = threadIdx.y;
 
-	int row = blockIdx.y * TILE + ty;
-	int col = blockIdx.x * TILE + tx;
+	int row = blockIdx.y * TILE + y;
+	int col = blockIdx.x * TILE + x;
 
-	float sum = 0.0f;
+	float v = 0;
 
-	for (int t = 0; t < N; t += TILE) {
+	for (int base = 0; base < n; base += TILE) {
+		as[y][x] = a[row * n + base + x];
+		bs[y][x] = b[(base + y) * n + col];
 
-		// 1. load one tile of A and one tile of B
-		As[ty][tx] = A[row * N + (t + tx)];
-		Bs[ty][tx] = B[(t + ty) * N + col];
-
-		// 2. wait for the whole tile
 		__syncthreads();
 
-		// 3. multiply using shared memory only
+		#pragma unroll
 		for (int k = 0; k < TILE; k++) {
-			sum += As[ty][k] * Bs[k][tx];
-		}
-
-		// 4. wait before loading the next tile
-		__syncthreads();
-	}
-
-	C[row * N + col] = sum;
-}
-
-
-
-// =====================================================================================
-// Kernels 4 and 5: SHARED TILING, B STORED TRANSPOSED
-//
-// Element (k, tx) of the B tile is stored at Bs[tx * pitch + k].
-// In the inner loop a warp (32 values of tx, same k) reads addresses `pitch` floats apart.
-// Shared memory has 32 banks, and bank = (float index) % 32:
-//
-//     pitch = 32    every thread hits the SAME bank     ->  32-way conflict
-//     pitch = 33    threads hit 32 DIFFERENT banks      ->  no conflict
-//
-// One extra column of padding (33 instead of 32) removes the conflict.
-//
-// Why is pitch a function argument and not a fixed number?
-// If the compiler knows pitch = 32, it merges 4 neighbouring reads into one 128-bit load,
-// which changes the conflict pattern. Passing pitch at run time keeps both cases on exactly
-// the same instructions, so the only difference you measure is the bank conflict.
-// =====================================================================================
-__global__ void matmul_shared_transposed(float *A, float *B, float *C, int N, int pitch) {
-	__shared__ float As[TILE][TILE];
-	__shared__ float Bs[TILE * (TILE + 1)];			// room for pitch up to 33
-
-	int tx = threadIdx.x;
-	int ty = threadIdx.y;
-
-	int row = blockIdx.y * TILE + ty;
-	int col = blockIdx.x * TILE + tx;
-
-	float sum = 0.0f;
-
-	for (int t = 0; t < N; t += TILE) {
-
-		As[ty][tx]          = A[row * N + (t + tx)];
-		Bs[tx * pitch + ty] = B[(t + ty) * N + col];		// store B transposed
-
-		__syncthreads();
-
-		for (int k = 0; k < TILE; k++) {
-			sum += As[ty][k] * Bs[tx * pitch + k];		// warp reads with stride = pitch
+			v += as[y][k] * bs[k][x];
 		}
 
 		__syncthreads();
 	}
 
-	C[row * N + col] = sum;
+	c[row * n + col] = v;
 }
 
 
 
-// =====================================================================================
-// Host code
-// =====================================================================================
+// Stages 17 and 18: same tiling, but B is stored transposed in shared memory.
+// A warp reads bs[x * pitch + k]: pitch 32 puts all 32 threads in one bank, pitch 33 spreads them.
+// Pitch is a runtime argument so both stages run exactly the same compiled kernel.
+__global__ void shared_tile_pitch(const float* a, const float* b, float* c, int n, int pitch) {
+	__shared__ float as[TILE][TILE];
+	__shared__ float bs[TILE * (TILE + 1)];
 
-const char *KERNEL_NAMES[5] = {
-	"naive_uncoalesced",
-	"coalesced",
-	"shared",
-	"shared_bank_conflict",
-	"shared_padded"
-};
+	int x = threadIdx.x;
+	int y = threadIdx.y;
 
+	int row = blockIdx.y * TILE + y;
+	int col = blockIdx.x * TILE + x;
 
-void launch(int kernel, float *A, float *B, float *C, int N) {
-	dim3 block(TILE, TILE);				// 32 x 32 = 1024 threads
-	dim3 grid(N / TILE, N / TILE);			// one block per 32 x 32 tile of C
+	float v = 0;
 
-	if (kernel == 0) {
-		matmul_uncoalesced<<<grid, block>>>(A, B, C, N);
+	for (int base = 0; base < n; base += TILE) {
+		as[y][x] = a[row * n + base + x];
+		bs[x * pitch + y] = b[(base + y) * n + col];
+
+		__syncthreads();
+
+		#pragma unroll
+		for (int k = 0; k < TILE; k++) {
+			v += as[y][k] * bs[x * pitch + k];
+		}
+
+		__syncthreads();
 	}
 
-	if (kernel == 1) {
-		matmul_coalesced<<<grid, block>>>(A, B, C, N);
-	}
-
-	if (kernel == 2) {
-		matmul_shared<<<grid, block>>>(A, B, C, N);
-	}
-
-	if (kernel == 3) {
-		matmul_shared_transposed<<<grid, block>>>(A, B, C, N, 32);	// pitch 32: bank conflicts
-	}
-
-	if (kernel == 4) {
-		matmul_shared_transposed<<<grid, block>>>(A, B, C, N, 33);	// pitch 33: padded
-	}
-
-	CHECK(cudaGetLastError());
+	c[row * n + col] = v;
 }
 
 
-// Used by qsort to sort the timings.
-int compare_floats(const void *a, const void *b) {
-	float x = *(float *)a;
-	float y = *(float *)b;
+
+void launch(int stage, const float* a, const float* b, float* c, int n) {
+	dim3 grid(n / TILE, n / TILE);
+	dim3 block(TILE, TILE);
+
+	if (stage == 0) {
+		naive_uncoalesced<<<grid, block>>>(a, b, c, n);
+	}
+
+	if (stage == 1) {
+		naive_coalesced<<<grid, block>>>(a, b, c, n);
+	}
+
+	if (stage == 2) {
+		shared_tile<<<grid, block>>>(a, b, c, n);
+	}
+
+	if (stage == 17) {
+		shared_tile_pitch<<<grid, block>>>(a, b, c, n, 32);
+	}
+
+	if (stage == 18) {
+		shared_tile_pitch<<<grid, block>>>(a, b, c, n, 33);
+	}
+
+	CUDA(cudaGetLastError());
+}
+
+
+
+int compare_floats(const void* p, const void* q) {
+	float x = *(const float*) p;
+	float y = *(const float*) q;
 
 	if (x < y) {
 		return -1;
@@ -237,172 +176,161 @@ int compare_floats(const void *a, const void *b) {
 
 
 
-int main(int argc, char **argv) {
-	// ---------------- 1. Read the arguments ----------------
+int main(int argc, char** argv) {
 
-	int kernel = -1;
+	// ---- Arguments ----
 
-	for (int i = 0; i < 5 && argc > 1; i++) {
-		if (strcmp(argv[1], KERNEL_NAMES[i]) == 0) {
-			kernel = i;
-		}
+	int stage = 0;
+	int n = 1024;
+	int reps = 20;
+
+	if (argc > 1) {
+		stage = atoi(argv[1]);
 	}
 
-	int N = 4096;					// default matrix size
-	int reps = 20;					// default number of timed launches
-
 	if (argc > 2) {
-		N = atoi(argv[2]);
+		n = atoi(argv[2]);
 	}
 
 	if (argc > 3) {
 		reps = atoi(argv[3]);
 	}
 
-	if (kernel < 0 || N < TILE || N % TILE != 0 || reps < 1) {
-		printf("usage: %s KERNEL [N] [REPS]\n", argv[0]);
-		printf("    KERNEL:  naive_uncoalesced | coalesced | shared | shared_bank_conflict | shared_padded\n");
-		printf("    N:       multiple of 32 (default 4096)\n");
-		printf("    REPS:    number of timed launches (default 20)\n");
+	int valid_stage = (stage == 0 || stage == 1 || stage == 2 || stage == 17 || stage == 18);
+
+	if (!valid_stage || n < TILE || n % TILE != 0 || n > 16384 || reps < 1) {
+		fprintf(stderr, "usage: mm STAGE[0, 1, 2, 17, 18] N[multiple of 32, <= 16384] REPS[>= 1]\n");
 		return 1;
 	}
 
 	cudaDeviceProp prop;
-	CHECK(cudaGetDeviceProperties(&prop, 0));
-	fprintf(stderr, "device=%s kernel=%s N=%d\n", prop.name, KERNEL_NAMES[kernel], N);
+	CUDA(cudaGetDeviceProperties(&prop, 0));
+	fprintf(stderr, "device=%s cc=%d.%d stage=%d n=%d\n", prop.name, prop.major, prop.minor, stage, n);
 
 
-	// ---------------- 2. Create the input matrices on the CPU ----------------
-	// Values are multiples of 1/8 between -1 and 1, so every product and sum is exact
-	// and the GPU result must match the CPU result exactly.
+	// ---- Inputs: multiples of 1/8, so every product and sum is exact ----
 
-	size_t count = (size_t)N * N;
+	size_t count = (size_t) n * n;
 	size_t bytes = count * sizeof(float);
 
-	float *A = (float *)malloc(bytes);
-	float *B = (float *)malloc(bytes);
-	float *C = (float *)malloc(bytes);
+	float* a = (float*) malloc(bytes);
+	float* b = (float*) malloc(bytes);
+	float* out = (float*) malloc(bytes);
 
 	srand(42);
 
 	for (size_t i = 0; i < count; i++) {
-		A[i] = (rand() % 17 - 8) / 8.0f;
-		B[i] = (rand() % 17 - 8) / 8.0f;
+		a[i] = (rand() % 17 - 8) / 8.0f;
+		b[i] = (rand() % 17 - 8) / 8.0f;
 	}
 
+	float *da, *db, *dc;
 
-	// ---------------- 3. Copy the inputs to the GPU ----------------
+	CUDA(cudaMalloc(&da, bytes));
+	CUDA(cudaMalloc(&db, bytes));
+	CUDA(cudaMalloc(&dc, bytes));
 
-	float *dA, *dB, *dC;
-
-	CHECK(cudaMalloc(&dA, bytes));
-	CHECK(cudaMalloc(&dB, bytes));
-	CHECK(cudaMalloc(&dC, bytes));
-
-	CHECK(cudaMemcpy(dA, A, bytes, cudaMemcpyHostToDevice));
-	CHECK(cudaMemcpy(dB, B, bytes, cudaMemcpyHostToDevice));
+	CUDA(cudaMemcpy(da, a, bytes, cudaMemcpyHostToDevice));
+	CUDA(cudaMemcpy(db, b, bytes, cudaMemcpyHostToDevice));
 
 
-	// ---------------- 4. Warm-up: 2 launches, not timed, not profiled by ncu ----------------
+	// ---- Warm-up (outside the NVTX range, so ncu skips it) ----
 
-	for (int i = 0; i < 2; i++) {
-		launch(kernel, dA, dB, dC, N);
+	for (int i = 0; i < 3; i++) {
+		launch(stage, da, db, dc, n);
 	}
 
-	CHECK(cudaDeviceSynchronize());
+	CUDA(cudaDeviceSynchronize());
 
 
-	// ---------------- 5. Check the result against the CPU ----------------
-	// Small N: check every element.  Large N: check 1024 elements spread over the matrix.
+	// ---- Correctness: every element for small N, 1024 samples for large N ----
 
-	CHECK(cudaMemcpy(C, dC, bytes, cudaMemcpyDeviceToHost));
+	CUDA(cudaMemcpy(out, dc, bytes, cudaMemcpyDeviceToHost));
 
 	size_t checks = 1024;
 
-	if (N <= 256) {
+	if (n <= 256) {
 		checks = count;
 	}
 
-	double max_error = 0.0;
+	double maxerr = 0;
 
 	for (size_t i = 0; i < checks; i++) {
-
-		size_t idx = i;
+		size_t index = i;
 
 		if (checks != count) {
-			idx = (i * 1000003) % count;		// jump around the matrix (1000003 is prime)
+			index = (i * 1000003) % count;		// 1000003 is prime: spreads samples over the matrix
 		}
 
-		int row = idx / N;
-		int col = idx % N;
+		int r = index / n;
+		int col = index % n;
 
-		double expected = 0.0;
+		double ref = 0;
 
-		for (int k = 0; k < N; k++) {
-			expected += (double)A[(size_t)row * N + k] * B[(size_t)k * N + col];
+		for (int k = 0; k < n; k++) {
+			ref += (double) a[(size_t) r * n + k] * b[(size_t) k * n + col];
 		}
 
-		double error = fabs(C[idx] - expected);
+		double err = fabs((double) out[index] - ref);
 
-		if (error > max_error) {
-			max_error = error;
+		// isfinite matters: a NaN error would pass a plain "err > limit" test.
+		if (!isfinite(out[index]) || err > 1e-3 + 1e-4 * fabs(ref)) {
+			fprintf(stderr, "correctness check failed at element %zu\n", index);
+			return 1;
+		}
+
+		if (err > maxerr) {
+			maxerr = err;
 		}
 	}
 
-	if (max_error > 1e-3) {
-		printf("WRONG RESULT: max error %g\n", max_error);
-		return 1;
-	}
 
+	// ---- Timed launches inside the NVTX range "measured_gemm" ----
 
-	// ---------------- 6. Timed launches, inside the NVTX range "measured_gemm" ----------------
-	// nsys shows this range on its timeline; ncu profiles only kernels inside it.
+	cudaEvent_t start, end;
+	CUDA(cudaEventCreate(&start));
+	CUDA(cudaEventCreate(&end));
 
-	cudaEvent_t start, stop;
-	CHECK(cudaEventCreate(&start));
-	CHECK(cudaEventCreate(&stop));
-
-	float *times_ms = (float *)malloc(reps * sizeof(float));
+	float* times = (float*) malloc(reps * sizeof(float));
 
 	nvtxRangePushA("measured_gemm");
 
 	for (int i = 0; i < reps; i++) {
+		CUDA(cudaEventRecord(start));
+		launch(stage, da, db, dc, n);
+		CUDA(cudaEventRecord(end));
 
-		CHECK(cudaEventRecord(start));
-		launch(kernel, dA, dB, dC, N);
-		CHECK(cudaEventRecord(stop));
-
-		CHECK(cudaEventSynchronize(stop));
-		CHECK(cudaEventElapsedTime(&times_ms[i], start, stop));
+		CUDA(cudaEventSynchronize(end));
+		CUDA(cudaEventElapsedTime(&times[i], start, end));
 	}
 
 	nvtxRangePop();
 
 
-	// ---------------- 7. Report the median time ----------------
+	// ---- Median time ----
 
-	qsort(times_ms, reps, sizeof(float), compare_floats);
+	qsort(times, reps, sizeof(float), compare_floats);
 
-	float  median_ms = times_ms[reps / 2];
-	double gflops    = 2.0 * N * N * N / (median_ms * 1e6);		// 2 * N^3 flops (multiply + add)
+	float ms = times[reps / 2];
+	double tflops = 2.0 * n * n * n / (ms * 1e9);
 
-	printf("%s,%d,%d,%.4f,%.1f,%zu,%g\n",
-	       KERNEL_NAMES[kernel], N, reps, median_ms, gflops, checks, max_error);
+	printf("stage,n,precision,reps,median_ms,tflops,checked_elements,max_abs_error\n");
+	printf("%d,%d,fp32,%d,%.6f,%.6f,%zu,%.8g\n", stage, n, reps, ms, tflops, checks, maxerr);
 
 
-	// ---------------- 8. Clean up ----------------
+	// ---- Clean up ----
 
 	cudaEventDestroy(start);
-	cudaEventDestroy(stop);
+	cudaEventDestroy(end);
 
-	cudaFree(dA);
-	cudaFree(dB);
-	cudaFree(dC);
+	cudaFree(da);
+	cudaFree(db);
+	cudaFree(dc);
 
-	free(A);
-	free(B);
-	free(C);
-	free(times_ms);
+	free(a);
+	free(b);
+	free(out);
+	free(times);
 
 	return 0;
 }

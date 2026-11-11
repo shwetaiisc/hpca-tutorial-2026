@@ -3,17 +3,17 @@
 One CUDA file, five kernels, two scripts. Each kernel changes one thing about how
 threads touch memory, and the profiler shows why the time changes.
 
-| Kernel | What changes | Lesson |
-|---|---|---|
-| `naive_uncoalesced` | `threadIdx.x` walks down rows of C | neighbouring threads load addresses N floats apart: uncoalesced |
-| `coalesced` | swap x and y | a warp loads 32 consecutive floats: coalesced |
-| `shared` | 32×32 tiles of A and B in shared memory | each global load is reused 32 times; no bank conflicts |
-| `shared_bank_conflict` | B tile stored transposed, pitch 32 | a warp reads one bank 32 times: 32-way bank conflict |
-| `shared_padded` | same kernel, pitch 33 | one padding column spreads the reads across all 32 banks |
+| Stage | Report name | Kernel | What changes | Lesson |
+|---|---|---|---|---|
+| 0 | `naive_uncoalesced` | `naive_uncoalesced` | `threadIdx.x` picks the row of C | neighbouring threads load addresses N floats apart: uncoalesced |
+| 1 | `coalesced` | `naive_coalesced` | `threadIdx.x` picks the column | a warp loads 32 consecutive floats: coalesced |
+| 2 | `shared` | `shared_tile` | 32×32 tiles of A and B in shared memory | each global load is reused 32 times; no bank conflicts |
+| 17 | `shared_bank_conflict` | `shared_tile_pitch`, pitch 32 | B tile stored transposed | a warp reads one bank 32 times: 32-way bank conflict |
+| 18 | `shared_padded` | `shared_tile_pitch`, pitch 33 | one padding column | the reads spread across all 32 banks |
 
-`shared_bank_conflict` and `shared_padded` run the same compiled kernel
-(`matmul_shared_transposed`); only the pitch argument (32 or 33) differs. Compare them
-for a clean before/after on bank conflicts.
+Stages 17 and 18 run the same compiled kernel; only the pitch argument (32 or 33)
+differs. Compare them for a clean before/after on bank conflicts. (The stage numbers
+come from a larger version of this code with more kernels.)
 
 ## Requirements
 
@@ -34,7 +34,7 @@ The script builds `build/mm`, checks every kernel against a CPU reference, and w
 `results/timing_N4096.csv`. To run one kernel by hand:
 
 ```bash
-./build/mm coalesced 4096 20
+./build/mm 1 4096 20      # stage, N, timed launches
 ```
 
 Reference result (RTX A6000, N = 4096):
