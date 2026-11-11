@@ -208,7 +208,12 @@ int main(int argc, char** argv) {
 	fprintf(stderr, "device=%s cc=%d.%d stage=%d n=%d\n", prop.name, prop.major, prop.minor, stage, n);
 
 
-	// ---- Inputs: multiples of 1/8, so every product and sum is exact ----
+	// Each step below is wrapped in an NVTX range, so the nsys timeline shows it as a labeled bar.
+
+
+	// ---- Inputs on the CPU: multiples of 1/8, so every product and sum is exact ----
+
+	nvtxRangePushA("make_inputs");
 
 	size_t count = (size_t) n * n;
 	size_t bytes = count * sizeof(float);
@@ -224,28 +229,49 @@ int main(int argc, char** argv) {
 		b[i] = (rand() % 17 - 8) / 8.0f;
 	}
 
+	nvtxRangePop();
+
+
+	// ---- GPU memory (the first CUDA call also starts the GPU context, ~0.1 s) ----
+
+	nvtxRangePushA("allocate");
+
 	float *da, *db, *dc;
 
 	CUDA(cudaMalloc(&da, bytes));
 	CUDA(cudaMalloc(&db, bytes));
 	CUDA(cudaMalloc(&dc, bytes));
 
+	nvtxRangePop();
+
+
+	// ---- Copy inputs to the GPU ----
+
+	nvtxRangePushA("copy_inputs");
+
 	CUDA(cudaMemcpy(da, a, bytes, cudaMemcpyHostToDevice));
 	CUDA(cudaMemcpy(db, b, bytes, cudaMemcpyHostToDevice));
 
+	nvtxRangePop();
 
-	// ---- Warm-up (outside the NVTX range, so ncu skips it) ----
+
+	// ---- Warm-up: 3 launches, not timed, and outside "measured_gemm" so ncu skips them ----
+
+	nvtxRangePushA("warmup");
 
 	for (int i = 0; i < 3; i++) {
 		launch(stage, da, db, dc, n);
 	}
 
-	CUDA(cudaDeviceSynchronize());
-
-
-	// ---- Correctness: every element for small N, 1024 samples for large N ----
-
+	// Copy the result back. This also waits for the warm-up kernels to finish.
 	CUDA(cudaMemcpy(out, dc, bytes, cudaMemcpyDeviceToHost));
+
+	nvtxRangePop();
+
+
+	// ---- Correctness on the CPU: every element for small N, 1024 samples for large N ----
+
+	nvtxRangePushA("check_on_cpu");
 
 	size_t checks = 1024;
 
@@ -284,27 +310,38 @@ int main(int argc, char** argv) {
 		}
 	}
 
+	nvtxRangePop();
 
-	// ---- Timed launches inside the NVTX range "measured_gemm" ----
 
-	cudaEvent_t start, end;
-	CUDA(cudaEventCreate(&start));
-	CUDA(cudaEventCreate(&end));
+	// ---- Timed launches inside the NVTX range "measured_gemm" (ncu profiles only this range) ----
+	// Each launch gets its own start/stop event. All launches are queued back to back and
+	// the CPU waits once at the end, so the timeline shows one wait instead of one per launch.
 
-	float* times = (float*) malloc(reps * sizeof(float));
+	cudaEvent_t* start = (cudaEvent_t*) malloc(reps * sizeof(cudaEvent_t));
+	cudaEvent_t* stop = (cudaEvent_t*) malloc(reps * sizeof(cudaEvent_t));
+
+	for (int i = 0; i < reps; i++) {
+		CUDA(cudaEventCreate(&start[i]));
+		CUDA(cudaEventCreate(&stop[i]));
+	}
 
 	nvtxRangePushA("measured_gemm");
 
 	for (int i = 0; i < reps; i++) {
-		CUDA(cudaEventRecord(start));
+		CUDA(cudaEventRecord(start[i]));
 		launch(stage, da, db, dc, n);
-		CUDA(cudaEventRecord(end));
-
-		CUDA(cudaEventSynchronize(end));
-		CUDA(cudaEventElapsedTime(&times[i], start, end));
+		CUDA(cudaEventRecord(stop[i]));
 	}
 
+	CUDA(cudaEventSynchronize(stop[reps - 1]));		// one wait for all launches
+
 	nvtxRangePop();
+
+	float* times = (float*) malloc(reps * sizeof(float));
+
+	for (int i = 0; i < reps; i++) {
+		CUDA(cudaEventElapsedTime(&times[i], start[i], stop[i]));
+	}
 
 
 	// ---- Median time ----
@@ -320,8 +357,13 @@ int main(int argc, char** argv) {
 
 	// ---- Clean up ----
 
-	cudaEventDestroy(start);
-	cudaEventDestroy(end);
+	for (int i = 0; i < reps; i++) {
+		cudaEventDestroy(start[i]);
+		cudaEventDestroy(stop[i]);
+	}
+
+	free(start);
+	free(stop);
 
 	cudaFree(da);
 	cudaFree(db);
