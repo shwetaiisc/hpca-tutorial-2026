@@ -23,8 +23,9 @@ for entry in $KERNELS; do
   # Nsight Compute: one timed launch, every section.
   #   --nvtx-include  skip the warm-up launches, profile inside "measured_gemm"
   #   (only 1 timed launch runs inside the range, so ncu profiles exactly one kernel)
+  #   --import-source yes  store mm.cu inside the report, so the source view works anywhere
   #   --clock-control none  keep the GPU's normal boost clock, so ncu time matches run.sh
-  ncu --set full --clock-control none --nvtx --nvtx-include "measured_gemm/" \
+  ncu --set full --import-source yes --clock-control none --nvtx --nvtx-include "measured_gemm/" \
       --force-overwrite -o "reports/$k" ./build/mm "$stage" "$N" 1 > /dev/null
 done
 

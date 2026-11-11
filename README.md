@@ -60,7 +60,8 @@ For each kernel this writes two reports into `reports/`:
 
 Nsight Compute only profiles a launch inside the NVTX range `measured_gemm`, so warm-up
 launches are skipped. It runs with `--clock-control none` so the GPU keeps its normal clock
-and the profiled time matches `run.sh`.
+and the profiled time matches `run.sh`. `--import-source yes` stores `src/mm.cu` inside each
+`.ncu-rep`, so the source view works even after you copy the report to another machine.
 
 ## Step 3: read the reports from the command line
 
