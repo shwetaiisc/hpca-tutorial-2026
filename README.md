@@ -11,8 +11,9 @@ threads touch memory, and the profiler shows why the time changes.
 | `shared_bank_conflict` | B tile stored transposed, pitch 32 | a warp reads one bank 32 times: 32-way bank conflict |
 | `shared_padded` | same kernel, pitch 33 | one padding column spreads the reads across all 32 banks |
 
-`shared_bank_conflict` and `shared_padded` run the same compiled kernel; only
-the pitch argument differs. Compare them for a clean before/after on bank conflicts.
+`shared_bank_conflict` and `shared_padded` run the same compiled kernel
+(`matmul_shared_transposed`); only the pitch argument (32 or 33) differs. Compare them
+for a clean before/after on bank conflicts.
 
 ## Requirements
 
